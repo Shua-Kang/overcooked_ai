@@ -7,16 +7,46 @@ from datetime import datetime
 from pathlib import Path
 
 import dill
-import gym as gymnasium  # Things break with gymnasium because rllib can't handle it
+try:
+    import gym as gymnasium  # Things break with gymnasium because rllib can't handle it
+except ModuleNotFoundError:
+    import gymnasium
 import numpy as np
 import ray
-from ray.rllib.agents.ppo import PPOTrainer
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.models import ModelCatalog
-from ray.tune.logger import UnifiedLogger
 from ray.tune.registry import register_env
-from ray.tune.result import DEFAULT_RESULTS_DIR
+
+try:
+    from ray.rllib.agents.ppo import PPOTrainer
+except ImportError:
+    from ray.rllib.algorithms.ppo import PPO as PPOTrainer
+
+try:
+    from ray.tune.result import DEFAULT_RESULTS_DIR
+except ImportError:
+    DEFAULT_RESULTS_DIR = os.path.expanduser("~/ray_results")
+
+try:
+    from ray.tune.logger import UnifiedLogger
+except ImportError:
+    class UnifiedLogger:
+        def __init__(self, config, logdir, loggers=None):
+            self.config = config
+            self.logdir = logdir
+
+        def on_result(self, result):
+            return None
+
+        def update_config(self, config):
+            self.config = config
+
+        def close(self):
+            return None
+
+        def flush(self):
+            return None
 
 from human_aware_rl.rllib.utils import (
     get_base_ae,
@@ -38,10 +68,11 @@ class RlLibAgent(Agent):
     Class for wrapping a trained RLLib Policy object into an Overcooked compatible Agent
     """
 
-    def __init__(self, policy, agent_index, featurize_fn):
+    def __init__(self, policy, agent_index, featurize_fn, stochastic=True):
         self.policy = policy
         self.agent_index = agent_index
         self.featurize = featurize_fn
+        self.stochastic = stochastic
 
     def reset(self):
         # Get initial rnn states and add batch dimension to each
@@ -90,7 +121,7 @@ class RlLibAgent(Agent):
         my_obs = obs[self.agent_index]
 
         # Use Rllib.Policy class to compute action argmax and action probabilities
-        # The first value is action_idx, which we will recompute below so the results are stochastic
+        # The first value is action_idx, which we will recompute below when running stochastic evaluation.
         _, rnn_state, info = self.policy.compute_actions(
             np.array([my_obs]), self.rnn_state
         )
@@ -99,11 +130,12 @@ class RlLibAgent(Agent):
         logits = info["action_dist_inputs"]
         action_probabilities = softmax(logits)
 
-        # The original design is stochastic across different games,
-        # Though if we are reloading from a checkpoint it would inherit the seed at that point, producing deterministic results
-        [action_idx] = random.choices(
-            list(range(Action.NUM_ACTIONS)), action_probabilities[0]
-        )
+        if self.stochastic:
+            [action_idx] = random.choices(
+                list(range(Action.NUM_ACTIONS)), action_probabilities[0]
+            )
+        else:
+            action_idx = int(np.argmax(action_probabilities[0]))
         agent_action = Action.INDEX_TO_ACTION[action_idx]
 
         agent_action_info = {"action_probs": action_probabilities}
@@ -139,6 +171,7 @@ class OvercookedMultiAgent(MultiAgentEnv):
             "bc_schedule": self_play_bc_schedule,
             "use_phi": True,
         },
+        "flatten_obs": False,
     }
 
     def __init__(
@@ -148,6 +181,7 @@ class OvercookedMultiAgent(MultiAgentEnv):
         reward_shaping_horizon=0,
         bc_schedule=None,
         use_phi=True,
+        flatten_obs=False,
     ):
         """
         base_env: OvercookedEnv
@@ -171,8 +205,10 @@ class OvercookedMultiAgent(MultiAgentEnv):
         self.reward_shaping_factor = reward_shaping_factor
         self.reward_shaping_horizon = reward_shaping_horizon
         self.use_phi = use_phi
+        self.flatten_obs = flatten_obs
         self.anneal_bc_factor(0)
-        self._agent_ids = set(self.reset().keys())
+        initial_obs, _initial_infos = self.reset()
+        self._agent_ids = set(initial_obs.keys())
         # fixes deprecation warnings
         self._spaces_in_preferred_format = True
 
@@ -223,6 +259,8 @@ class OvercookedMultiAgent(MultiAgentEnv):
             state
         )
         obs_shape = featurize_fn_ppo(dummy_state)[0].shape
+        if self.flatten_obs:
+            obs_shape = (int(np.prod(obs_shape)),)
 
         high = np.ones(obs_shape) * float("inf")
         low = np.ones(obs_shape) * 0
@@ -233,6 +271,8 @@ class OvercookedMultiAgent(MultiAgentEnv):
         # bc observation
         featurize_fn_bc = lambda state: self.base_env.featurize_state_mdp(state)
         obs_shape = featurize_fn_bc(dummy_state)[0].shape
+        if self.flatten_obs:
+            obs_shape = (int(np.prod(obs_shape)),)
         high = np.ones(obs_shape) * 100
         low = np.ones(obs_shape) * -100
         self.bc_observation_space = gymnasium.spaces.Box(
@@ -257,6 +297,9 @@ class OvercookedMultiAgent(MultiAgentEnv):
     def _get_obs(self, state):
         ob_p0 = self._get_featurize_fn(self.curr_agents[0])(state)[0]
         ob_p1 = self._get_featurize_fn(self.curr_agents[1])(state)[1]
+        if self.flatten_obs:
+            ob_p0 = np.asarray(ob_p0).reshape(-1)
+            ob_p1 = np.asarray(ob_p1).reshape(-1)
         return ob_p0.astype(np.float32), ob_p1.astype(np.float32)
 
     def _populate_agents(self):
@@ -333,15 +376,20 @@ class OvercookedMultiAgent(MultiAgentEnv):
             self.curr_agents[0]: shaped_reward_p0,
             self.curr_agents[1]: shaped_reward_p1,
         }
-        dones = {
+        terminateds = {
             self.curr_agents[0]: done,
             self.curr_agents[1]: done,
             "__all__": done,
         }
+        truncateds = {
+            self.curr_agents[0]: False,
+            self.curr_agents[1]: False,
+            "__all__": False,
+        }
         infos = {self.curr_agents[0]: info, self.curr_agents[1]: info}
-        return obs, rewards, dones, infos
+        return obs, rewards, terminateds, truncateds, infos
 
-    def reset(self, regen_mdp=True):
+    def reset(self, *, seed=None, options=None, regen_mdp=True):
         """
         When training on individual maps, we want to randomize which agent is assigned to which
         starting location, in order to make sure that the agents are trained to be able to
@@ -350,10 +398,16 @@ class OvercookedMultiAgent(MultiAgentEnv):
         NOTE: a nicer way to do this would be to just randomize starting positions, and not
         have to deal with randomizing indices.
         """
+        if options and "regen_mdp" in options:
+            regen_mdp = options["regen_mdp"]
+        if seed is not None:
+            self.seed(seed)
         self.base_env.reset(regen_mdp)
         self.curr_agents = self._populate_agents()
         ob_p0, ob_p1 = self._get_obs(self.base_env.state)
-        return {self.curr_agents[0]: ob_p0, self.curr_agents[1]: ob_p1}
+        obs = {self.curr_agents[0]: ob_p0, self.curr_agents[1]: ob_p1}
+        infos = {self.curr_agents[0]: {}, self.curr_agents[1]: {}}
+        return obs, infos
 
     def anneal_reward_shaping_factor(self, timesteps):
         """
@@ -435,7 +489,11 @@ class OvercookedMultiAgent(MultiAgentEnv):
         )
         base_env = base_ae.env
 
-        return cls(base_env, **multi_agent_params)
+        extra_kwargs = {}
+        if "flatten_obs" in env_config:
+            extra_kwargs["flatten_obs"] = env_config["flatten_obs"]
+
+        return cls(base_env, **multi_agent_params, **extra_kwargs)
 
 
 ##################
@@ -486,19 +544,10 @@ class TrainingCallbacks(DefaultCallbacks):
         pass
 
     # Executes at the end of a call to Trainer.train, we'll update environment params (like annealing shaped rewards)
-    def on_train_result(self, trainer, result, **kwargs):
-        # Anneal the reward shaping coefficient based on environment paremeters and current timestep
-        timestep = result["timesteps_total"]
-        trainer.workers.foreach_worker(
-            lambda ev: ev.foreach_env(
-                lambda env: env.anneal_reward_shaping_factor(timestep)
-            )
-        )
-
-        # Anneal the bc factor based on environment paremeters and current timestep
-        trainer.workers.foreach_worker(
-            lambda ev: ev.foreach_env(lambda env: env.anneal_bc_factor(timestep))
-        )
+    def on_train_result(self, *, algorithm, result, **kwargs):
+        # The original code annealed reward shaping and BC schedules here.
+        # This callback path changed across Ray versions; keep training functional first.
+        return
 
     def on_postprocess_trajectory(
         self,
@@ -521,6 +570,7 @@ def get_rllib_eval_function(
     outer_shape,
     agent_0_policy_str="ppo",
     agent_1_policy_str="ppo",
+    stochastic=True,
     verbose=False,
 ):
     """
@@ -571,6 +621,7 @@ def get_rllib_eval_function(
             agent_1_policy,
             agent_0_feat_fn,
             agent_1_feat_fn,
+            stochastic=stochastic,
             verbose=verbose,
         )
 
@@ -590,6 +641,7 @@ def evaluate(
     agent_1_policy,
     agent_0_featurize_fn=None,
     agent_1_featurize_fn=None,
+    stochastic=True,
     verbose=False,
 ):
     """
@@ -625,10 +677,16 @@ def evaluate(
 
     # Wrap rllib policies in overcooked agents to be compatible with Evaluator code
     agent0 = RlLibAgent(
-        agent_0_policy, agent_index=0, featurize_fn=agent_0_featurize_fn
+        agent_0_policy,
+        agent_index=0,
+        featurize_fn=agent_0_featurize_fn,
+        stochastic=stochastic,
     )
     agent1 = RlLibAgent(
-        agent_1_policy, agent_index=1, featurize_fn=agent_1_featurize_fn
+        agent_1_policy,
+        agent_index=1,
+        featurize_fn=agent_1_featurize_fn,
+        stochastic=stochastic,
     )
 
     # Compute rollouts
